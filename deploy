@@ -1,0 +1,535 @@
+#!/usr/bin/php -q
+<?php 
+/** 
+ * Author: Dan Shumaker
+ * Date: 10/1/2012
+ * script: deploy
+ 
+Description: Move files, database, or code from one acquia server to the next and run drush commands.
+    - Yes you can use the gui to do most of these things (not the drush, varnish, memcache stuff) but CLI's are better! :)
+ 
+Features:  
+     - Task Queue - It will wait until one acquia task process is done before starting another one.  This is 
+     nice because their might be six or seven acquia tasks that need to be done for any one push and with
+     this deploy tool you only have to initiate the sequence and then "walk away".  If any one of the tasks
+     fail then the queue of tasks is aborted (not rolled back but just halted).
+ 
+     - Command line Automation - While the gui is nice I wanted to be able to execute several tasks at once .  This deploy
+     script automates that for you.
+ 
+Dependencies:
+     - This deploy script depends on valid drush aliases being installed on your acquia server.
+        - You'll need acquia's aliases for your sites: https://docs.acquia.com/cloud/drush-aliases
+        - You'll need acquia's cloud api for your site: https://insight.acquia.com/cloud/util/download/drush
+     - Only tested with drush 5.
+     - access to acquia network accounts.
+     - ssh keys installed on acquia server and network accounts.
+ 
+Setup:
+    - Initally you need to setup a deploy process up by saving all the credentials in a configuration file.  Then after that you call deploy with
+      the --load parameter and nothing else and it does the rest.
+ 
+Typical usages after setup:
+ 
+    deploy --load=stage_to_dev_db+files.dep
+    deploy --load=dev_to_stage_code_only.dep
+    deploy --load=dev_to_stage.dep
+    deploy --load=stage_to_prod.dep
+ 
+Typical setup usage:
+ 
+     Setup for dev_to_stage_db_files.dep
+        deploy --varnish=1 \
+           --database=1 \
+           --files=1 \
+           --memcache=1 \
+           --drush="vset drupal_stale_file_threshold 1 -y;vset shield_user XXXXXX -y; vset shield_pass XXXXXXX -y; cc all;vset drupal_stale_file_threshold 172800 -y" \
+           --source=@drush_dev_server_alais \
+          --dest=@drush_stage_server_alias \
+          --dest_db=XXXX \
+          --dest_env=dev  \
+          --dest_host=staging-XXXX.prod.hosting.acquia.com \
+          --dest_domain=XXXXXdev.prod.acquia-sites.com \
+          --save=stage_to_dev_db_files.dep
+ 
+Command Line Options:
+ 	--varnish         ( off )   -- (boolean) Purges the varnish cache for the site.
+	--database        ( off )   -- Specifies the databasename to push & pull
+	--code            ( off )   -- (boolean) Whether or not to push code -- off by default
+	--files           ( off )   -- (boolean) whether or not to push the default/files directory
+	--backup          ( off )   -- (boolean) backup the database before pushing and pulling it.
+  --memcache        ( off )   -- (boolean) purge memcache on server
+	--drush           (            (quote surrounded drush commands with the drush left out of the beginning of the command see examples)
+	--source          ( @dev )  (drush alias of source site)
+	--dest            ( @test )  ( drush alias of destination site)
+	--dest_db         ( autocalculated from drush dest alais )    -- you can override the autocalculated values if you wish.
+	--dest_env        ( autocalculated from drush dest alais )
+	--dest_host       ( autocalculated from drush dest alais )
+	--dest_domain     ( autocalculated from drush dest alais )
+	--save            ( off )    (don't run any commands but save the settings to a file for later use -- RUN THIS FIRST)
+	--load            ( off )    (specify a deploy settings / configuration file to load and execute) 
+	--print           ( off )    (print help)
+
+ */
+
+class CommandLine {
+
+    public $args = array();
+
+    function __construct() { }
+    public function parseArgs($argv){
+        $local_args = array();
+        array_shift($argv);
+        foreach ($argv as $arg){
+            // --foo --bar=baz
+            if (substr($arg,0,2) == '--'){
+                $eqPos = strpos($arg,'=');
+                // --foo
+                if ($eqPos === false){
+                    $key = substr($arg,2);
+                    if ($key === 'help') { $this->print_help(); exit(); }
+                    if (isset($this->args[$key])) {
+                      $local_args[$key] = true;
+                    } else {
+                      $this->print_help($key);
+                      exit();
+                    }
+                }
+                // --bar=baz
+                else {
+                    $key                = substr($arg,2,$eqPos-2);
+                    $value              = substr($arg,$eqPos+1);
+                    $local_args[$key] = $value;
+                }
+            }
+            // plain-arg
+            else {
+                $this->print_help($arg);
+                exit();
+            }
+        }
+        return $local_args;
+    }
+    public function print_help($bad='') {
+      if ($bad !== '') {
+        print "\nERROR:Invalid arguement " . $bad . "\n\n";
+      }
+
+      print "\n Sample command line : \n";
+      foreach($this->args as $key => $value ) { 
+        if ($value) {
+          printf("--%s=%-s ", $key , $value? $value: 'off' );
+        }
+      }
+      print "\n\n";
+
+      print "\nCommand line options are:\n";
+      foreach($this->args as $key => $value ) printf("\t--%-15s ( %-s )\n", $key , $value? $value: 'off' );
+    }
+    public function add_option($option, $value=false) {
+      $this->args[$option] = $value;
+    }
+    public function load_settings( $file ) {
+      $vals = file_get_contents($file);
+      $this->args = unserialize($vals);
+    }
+    function ismake($dir) {
+      if (is_dir($dir)) {
+        return;
+      } else {
+          if (mkdir($dir, 0777, true)) {
+            return;
+          } else {
+            print "Couldn't create directory ". $dir;
+            exit();
+          }
+      }
+    }
+    public function save_settings( $file ) {
+      $base = dirname($file) ;
+      $this->ismake($base);
+      $args = serialize($this->args);
+      file_put_contents($file, $args );
+    }
+}
+
+class StopWatch { 
+    public $total; 
+    public $time; 
+    
+    public function __construct() { 
+        $this->total = $this->time = microtime(true); 
+    } 
+    
+    public function clock() { 
+        return -$this->time + ($this->time = microtime(true)); 
+    } 
+    
+    public function elapsed() { 
+        return microtime(true) - $this->total; 
+    } 
+    
+    public function reset() { 
+        $this->total=$this->time=microtime(true); 
+    } 
+} 
+
+class Tio {
+  // If wanted pretty output to the browser then I'd use krumo:  http://krumo.sourceforge.net/
+  // But I want terminal and file output.
+  public $prompt = FALSE;
+  public $verbose = FALSE;
+  public $timing = FALSE;
+  public $db;
+  public $file = FALSE;
+  public $start_time;
+  public $stderr;
+  public $stdin;
+  public $stdout;
+  public $io = array(
+      0 => array("pipe","r"),   // stdin , what child proc will read from
+      1 => array("pipe", "w"),  // stdout is a pipe that the child will write to
+      2 => array("pipe", "w") // stderr is a pipe that the child will write to
+    );
+  function __construct() {
+    $this->start_time = new StopWatch();
+  }
+  public function p($str, $prompt=FALSE, $error=FALSE) {
+    if (is_array($str) && $this->verbose ) {
+      if ($this->file) {
+        if (is_string($this->file)) {
+          $this->file = fopen($this->file, 'w') or die('failed to open file') ;
+        }
+        ob_start();
+        var_dump($str);
+        $result = ob_get_clean();
+        fwrite($this->file, $result);
+      } else {
+        print_r($str);
+      }
+    }
+    if ($this->verbose || $error ) {
+      if ($this->file) {
+        if (is_string($this->file)) {
+          $this->file = fopen($this->file, 'w') or die('failed to open file') ;
+        }
+        fwrite($this->file, $str);
+      } else {
+        print $str . "\n";
+      }
+    }
+  }
+  function pt($start=0) {
+    if ($this->timing) {
+      if ($start === 1) {
+        $this->start_time->reset();
+      } 
+      if ($this->start_time->elapsed() > 60) {
+        $elapsed = $this->start_time->elapsed() / 60;
+        $estr = round($elapsed,2) . " minutes ";
+      } else {
+        $estr = round($this->start_time->elapsed(),2) . " seconds ";
+      }
+      print date("g:i:s A D, F jS Y",time()) . " Elapsed: " . $estr . "\n";
+    }
+  }
+
+  private function read_til_end($pipe) {
+    $buffer = "";
+    $results = "";
+    // Read til the end
+    while (($buffer = fgets($pipe)) !== false) {
+      $results .= $buffer;
+    }
+    if (!feof($pipe)) {
+      echo "Error: unexpected fgets() fail\n";
+    }
+    return $results;
+  }
+  /**
+   * Blocking command execution
+   */
+  public function run($command) {
+
+      print $command . "\n";
+      $this->stderr = '';
+      $this->stdout = '';
+      $process = proc_open($command, $this->io, $pipes);
+      if (is_resource($process)) {
+        $this->stdout .= stream_get_line($pipes[1], 65535);
+        $this->stderr .= stream_get_line($pipes[2], 65535);
+        $status = proc_get_status($process);
+        while ($status['running']) {
+          $this->stdout .= stream_get_line($pipes[1], 65535);
+          $this->stderr .= stream_get_line($pipes[2], 65535);
+          print "Waiting for " . $status['pid'] . "\n";
+          sleep(1);
+          $status = proc_get_status($process);
+        }
+        // Get the last output
+        $this->stdout .= stream_get_line($pipes[1], 65535);
+        $this->stderr .= stream_get_line($pipes[2], 65535);
+        fclose($pipes[0]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+      }
+      proc_close($process);
+  }
+
+  public function ismake($dir) {
+    if (is_dir($dir)) {
+      return;
+    } else {
+        if (mkdir($dir, 0777, true)) {
+          return;
+        } else {
+          $this->p("Couldn't create directory ". $dir);
+          exit();
+        }
+    }
+  }
+}
+
+class deploy{
+
+  function __construct() {
+    $this->cli = new CommandLine();
+    $this->io = new Tio();
+    $this->task_id = 0;
+    $this->backedup = FALSE;
+  }
+
+  public function processargs($argv) {
+    // Options 
+    $this->cli->add_option( 'varnish' );
+    $this->cli->add_option( 'database' );
+    $this->cli->add_option( 'code' );
+    $this->cli->add_option( 'files' );
+    $this->cli->add_option( 'backup' );
+    $this->cli->add_option( 'memcache' );
+    $this->cli->add_option( 'drush', 'semi-colon separated list of commands beginning with drush and dest alias' );
+    $this->cli->add_option( 'source', '@becker.dev' );
+    $this->cli->add_option( 'dest', '@becker.test' );
+    $this->cli->add_option( 'dest_db', 'autocalculated from drush dest alais' );
+    $this->cli->add_option( 'dest_env', 'autocalculated from drush dest alais' );
+    $this->cli->add_option( 'dest_host', 'autocalculated from drush dest alais' );
+    $this->cli->add_option( 'dest_domain', 'autocalculated from drush dest alais' );
+    $this->cli->add_option( 'save' );   // Save Options
+    $this->cli->add_option( 'load' );   // Load Options
+    $this->cli->add_option( 'print' );   // Print Options
+
+    $cli_opts = $this->cli->parseArgs($argv);
+
+    $settings = './deploy.settings';
+    if (isset($cli_opts['save'])) {
+      if (is_string($cli_opts['save'])) {
+        $settings = $cli_opts['save'];
+      }
+      $this->cli->args = array_merge($this->cli->args, $cli_opts);
+      $this->get_dest_info();
+      $this->cli->save_settings($settings);
+      print "\nSaved settings to :" . $settings . "\n";
+      $this->cli->print_help();
+      exit();
+    }
+
+    if (isset($cli_opts['load'])) {
+      $this->cli->load_settings($cli_opts['load']);
+    }
+
+    $this->cli->args = array_merge($this->cli->args, $cli_opts);
+
+    if ($this->cli->args['print']) {
+      $this->cli->print_help();
+      exit();
+    }
+
+    if ($this->cli->args['backup']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      print $this->backup() . "\n" ; 
+      $this->io->pt();
+    }
+
+    if ($this->cli->args['code']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      print $this->code() . "\n";
+      $this->io->pt();
+    }
+
+    if ($this->cli->args['files']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      print $this->files() . "\n";
+      $this->io->pt();
+    }
+
+    if ($this->cli->args['database']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      print $this->database() . "\n";
+      $this->io->pt();
+    }
+
+    if ($this->cli->args['varnish']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      print $this->varnish() . "\n";
+      $this->io->pt();
+    }
+    if ($this->cli->args['memcache']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      print $this->memcache() . "\n";
+      $this->io->pt();
+    }
+    if ($this->cli->args['drush']) {
+      $this->io->timing = true;
+      $this->io->pt(1);
+      print $this->drush() . "\n";
+      $this->io->pt();
+    }
+  }
+
+  public function get_dest_info() {
+    $this->io->run('drush ' . $this->cli->args['dest'] . ' ac-database-instance-list');
+    $res = preg_match('/\bname(?:\s)+:(?:\s)+(\w*)/', $this->io->stdout, $db_name);
+    if ($res == 1) {
+      $this->cli->args['dest_db'] = $db_name[1];
+    } else {
+      print "Error determining the database name, aborting";
+      exit();
+    }
+    $this->io->run('drush ' . $this->cli->args['dest'] . ' ac-environment-info ');
+    $res = preg_match('/\bname(?:\s)+:(?:\s)+(\w*)/', $this->io->stdout, $env);
+    if ($res) {
+      $this->cli->args['dest_env'] = $env[1];
+    } else {
+      print 'Error determining destination environment of ' . $this->cli->args['dest'] . '\n';
+      exit();
+    }
+    $res = preg_match('/ssh_host(?:\s)+:(?:\s)+(\S+)/', $this->io->stdout, $server);
+    if ($res) {
+      $this->cli->args['dest_host'] = $server[1];
+    } else {
+      print 'Error determining ssh_host of ' . $this->cli->args['dest'] . '\n';
+      exit();
+    }
+    $this->io->run('drush ' . $this->cli->args['dest'] . ' ac-domain-list ' );
+    $res = preg_match('/name(?:\s)+:(?:\s)+(\S+)/', $this->io->stdout, $domain);
+    if ($res) {
+      $this->cli->args['dest_domain'] = $domain[1];
+    } else {
+      print 'Error determining domain of ' . $this->cli->args['dest'] . '\n';
+      exit();
+    }
+  }
+
+  public function backup() {
+    $state = "ERROR";
+    $this->io->run('drush ' . $this->cli->args['dest'] . ' ac-database-instance-backup ' . $this->cli->args['dest_db']);
+    $state = $this->wait_for_acquia($this->get_ac_task());
+    $this->backedup = TRUE;
+    return $state;
+  }
+  public function get_ac_task() {
+    $output = $this->io->stdout . $this->io->stderr;
+    $res = preg_match('/Task (\d+)/', $output, $task);
+    if ($res) {
+      $this->task_id = $task[1];
+      return $task[1];
+    } else {
+      print "Error retrieving Acquia Task , aborting\n";
+      print $output;
+      exit();
+    }
+  }
+
+  public function wait_for_acquia($task_id) {
+
+    $state = array(0 => 'test', 1 => 'first');
+    while ($state[1] != 'done') {
+      $this->io->run("drush " . $this->cli->args['dest'] . ' ac-task-info ' . $task_id);
+      $res = preg_match('/\bstate(?:\s)+:(?:\s)+(\w*)/', $this->io->stdout, $state);
+      if ($res) {
+        if (count($state) > 1) {
+          if ($state[1] != 'done') {
+            print implode(' ', array('Task', $task_id , 'is', $state[1] ,"...\n"));
+            sleep(5);
+          } else {
+            print "\nFinished\n";
+            return $state[1];
+          }
+        } else {
+          print "\nALERT: No task state found in output. Here is what was found:\n";
+          print_r($state);
+          print "\n";
+          $state = array(0 => 'transition', 1 => 'running');
+          sleep(5);
+        }
+      } else {
+        // Didn't find state in the output for some reason, should still wait.
+        // just print the output in case.
+        print "\nALERT: No task state found in output\nConsidering this as still running\nPrinting output\n";
+        print_r($this->io->stdout);
+        print "\n";
+        $state = array(0 => 'transition', 1 => 'running');
+        sleep(5);
+      }
+    }
+}
+  public function code() {
+    $this->io->run('drush ' . $this->cli->args['source'] . ' ac-code-deploy ' . $this->cli->args['dest_env']);
+    return $this->wait_for_acquia($this->get_ac_task());
+  }
+
+  public function files() {
+    $this->io->run('drush ' . $this->cli->args['source'] . ' ac-files-copy ' . $this->cli->args['dest_env']);
+    return $this->wait_for_acquia($this->get_ac_task());
+  }
+
+  public function database() {
+    if (!$this->backedup) {
+      $this->backup();
+    }
+    $this->io->run(implode(' ', array('drush', $this->cli->args['source'], 'ac-database-copy', $this->cli->args['dest_db'], $this->cli->args['dest_env'])));
+    return $this->wait_for_acquia($this->get_ac_task());
+  }
+
+  public function memcache() {
+    $this->io->run('ssh ' . $this->cli->args['dest_host'] . ' "memflush --server=localhost:11211"');
+  }
+
+  public function varnish() {
+    $this->io->run('drush ' . $this->cli->args['dest'] . ' ac-domain-purge ' . $this->cli->args['dest_domain']);
+    $output = $this->io->stdout . $this->io->stderr;
+    $res = preg_match('/\bid(?:\s)+:(?:\s)+(\w*)/', $output, $id);
+    if ($res) {
+      $this->task_id = $id[1];
+    } else {
+      print "Error retrieving Acquia Task , aborting\n";
+      print $output;
+      exit();
+    }
+    return $this->wait_for_acquia($this->task_id);
+  }
+
+  public function drush() {
+     if ($this->cli->args['drush'] != "semi-colon separated list of commands beginning with drush and dest alias" ) {
+      $cmds = explode(";", $this->cli->args['drush']);
+      foreach( $cmds as $cmd ) {
+        $this->io->run(implode(" ", array("drush", $this->cli->args['dest'], $cmd)));
+      }
+    }
+  }
+}
+/**
+ * MAIN
+ */
+
+$main = new deploy();
+
+$main->processargs($argv);
+
+?>
