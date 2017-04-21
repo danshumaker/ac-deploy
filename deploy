@@ -2,21 +2,26 @@
 <?php 
 /** 
  * Author: Dan Shumaker
- * Date: 10/1/2012
+ * Date: 10/1/2012 - 1/4/2014
  * script: deploy
+ */
+require_once dirname(__FILE__) . '/cli_settings.php';
  
+$help = "
 Description: Move files, database, or code from one acquia server to the next and run drush commands.
     - Yes you can use the gui to do most of these things (not the drush, varnish, memcache stuff) but CLI's are better! :)
  
 Features:  
      - Task Queue - It will wait until one acquia task process is done before starting another one.  This is 
      nice because their might be six or seven acquia tasks that need to be done for any one push and with
-     this deploy tool you only have to initiate the sequence and then "walk away".  If any one of the tasks
+     this deploy tool you only have to initiate the sequence and then \"walk away\".  If any one of the tasks
      fail then the queue of tasks is aborted (not rolled back but just halted).
  
      - Command line Automation - While the gui is nice I wanted to be able to execute several tasks at once .  This deploy
      script automates that for you.
+     ";
  
+/*
 Dependencies:
      - This deploy script depends on valid drush aliases being installed on your acquia server.
         - You'll need acquia's aliases for your sites: https://docs.acquia.com/cloud/drush-aliases
@@ -72,86 +77,6 @@ Command Line Options:
 
  */
 
-class CommandLine {
-
-    public $args = array();
-
-    function __construct() { }
-    public function parseArgs($argv){
-        $local_args = array();
-        array_shift($argv);
-        foreach ($argv as $arg){
-            // --foo --bar=baz
-            if (substr($arg,0,2) == '--'){
-                $eqPos = strpos($arg,'=');
-                // --foo
-                if ($eqPos === false){
-                    $key = substr($arg,2);
-                    if ($key === 'help') { $this->print_help(); exit(); }
-                    if (isset($this->args[$key])) {
-                      $local_args[$key] = true;
-                    } else {
-                      $this->print_help($key);
-                      exit();
-                    }
-                }
-                // --bar=baz
-                else {
-                    $key                = substr($arg,2,$eqPos-2);
-                    $value              = substr($arg,$eqPos+1);
-                    $local_args[$key] = $value;
-                }
-            }
-            // plain-arg
-            else {
-                $this->print_help($arg);
-                exit();
-            }
-        }
-        return $local_args;
-    }
-    public function print_help($bad='') {
-      if ($bad !== '') {
-        print "\nERROR:Invalid arguement " . $bad . "\n\n";
-      }
-
-      print "\n Sample command line : \n";
-      foreach($this->args as $key => $value ) { 
-        if ($value) {
-          printf("--%s=%-s ", $key , $value? $value: 'off' );
-        }
-      }
-      print "\n\n";
-
-      print "\nCommand line options are:\n";
-      foreach($this->args as $key => $value ) printf("\t--%-15s ( %-s )\n", $key , $value? $value: 'off' );
-    }
-    public function add_option($option, $value=false) {
-      $this->args[$option] = $value;
-    }
-    public function load_settings( $file ) {
-      $vals = file_get_contents($file);
-      $this->args = unserialize($vals);
-    }
-    function ismake($dir) {
-      if (is_dir($dir)) {
-        return;
-      } else {
-          if (mkdir($dir, 0777, true)) {
-            return;
-          } else {
-            print "Couldn't create directory ". $dir;
-            exit();
-          }
-      }
-    }
-    public function save_settings( $file ) {
-      $base = dirname($file) ;
-      $this->ismake($base);
-      $args = serialize($this->args);
-      file_put_contents($file, $args );
-    }
-}
 
 class StopWatch { 
     public $total; 
@@ -292,8 +217,8 @@ class Tio {
 
 class deploy{
 
-  function __construct() {
-    $this->cli = new CommandLine();
+  function __construct($help) {
+    $this->cli = new CommandLineSettings( $help );
     $this->io = new Tio();
     $this->task_id = 0;
     $this->backedup = FALSE;
@@ -301,43 +226,49 @@ class deploy{
 
   public function processargs($argv) {
     // Options 
-    $this->cli->add_option( 'varnish' );
-    $this->cli->add_option( 'database' );
-    $this->cli->add_option( 'code' );
-    $this->cli->add_option( 'files' );
-    $this->cli->add_option( 'backup' );
-    $this->cli->add_option( 'memcache' );
-    $this->cli->add_option( 'drush', 'semi-colon separated list of commands beginning with drush and dest alias' );
-    $this->cli->add_option( 'source', '@becker.dev' );
-    $this->cli->add_option( 'dest', '@becker.test' );
-    $this->cli->add_option( 'dest_db', 'autocalculated from drush dest alais' );
-    $this->cli->add_option( 'dest_env', 'autocalculated from drush dest alais' );
-    $this->cli->add_option( 'dest_host', 'autocalculated from drush dest alais' );
-    $this->cli->add_option( 'dest_domain', 'autocalculated from drush dest alais' );
-    $this->cli->add_option( 'save' );   // Save Options
-    $this->cli->add_option( 'load' );   // Load Options
-    $this->cli->add_option( 'print' );   // Print Options
+    $this->cli->add_option( 'varnish', false, true );
+    $this->cli->add_option( 'database', false, true );
+    $this->cli->add_option( 'code', false, true );
+    $this->cli->add_option( 'files', false, true );
+    $this->cli->add_option( 'backup', false, true );
+    $this->cli->add_option( 'memcache', false, true );
+    $this->cli->add_option( 'drush', 'semi-colon separated list of commands beginning with drush and dest alias',true );
+    $this->cli->add_option( 'source', '@becker.dev', true );
+    $this->cli->add_option( 'dest', '@becker.test', true );
+    $this->cli->add_option( 'dest_db', 'autocalculated from drush dest alais', true );
+    $this->cli->add_option( 'dest_env', 'autocalculated from drush dest alais', true );
+    $this->cli->add_option( 'dest_host', 'autocalculated from drush dest alais', true );
+    $this->cli->add_option( 'dest_domain', 'autocalculated from drush dest alais', true );
 
-    $cli_opts = $this->cli->parseArgs($argv);
+    $this->cli->parseArgs($argv);
 
-    $settings = './deploy.settings';
-    if (isset($cli_opts['save'])) {
-      if (is_string($cli_opts['save'])) {
-        $settings = $cli_opts['save'];
+
+    if ($this->cli->args['load']) {
+      $this->cli->load_settings();
+      // Add ability to override settings
+      foreach($argv as $key => $arg) {
+        if (substr($arg, 0, 7) == '--load=') {
+          unset($argv[$key]);
+          break;
+        }
       }
-      $this->cli->args = array_merge($this->cli->args, $cli_opts);
+      $this->cli->parseArgs($argv);
+    }
+
+    if ($this->cli->args['save']) {
       $this->get_dest_info();
-      $this->cli->save_settings($settings);
-      print "\nSaved settings to :" . $settings . "\n";
+      $this->cli->save_settings();
       $this->cli->print_help();
       exit();
     }
 
-    if (isset($cli_opts['load'])) {
-      $this->cli->load_settings($cli_opts['load']);
-    }
+    $p = $this->cli->args['print'];
 
-    $this->cli->args = array_merge($this->cli->args, $cli_opts);
+
+    if ($p) {
+      $this->cli->print_help();
+      exit();
+    }
 
     if ($this->cli->args['print']) {
       $this->cli->print_help();
@@ -347,47 +278,47 @@ class deploy{
     if ($this->cli->args['backup']) {
       $this->io->timing = true;
       $this->io->pt(1);
-      print $this->backup() . "\n" ; 
+      print "\n" . $this->backup() . "\n" ; 
       $this->io->pt();
     }
 
     if ($this->cli->args['code']) {
       $this->io->timing = true;
       $this->io->pt(1);
-      print $this->code() . "\n";
+      print "\n" . $this->code() . "\n";
       $this->io->pt();
     }
 
     if ($this->cli->args['files']) {
       $this->io->timing = true;
       $this->io->pt(1);
-      print $this->files() . "\n";
+      print "\n" . $this->files() . "\n";
       $this->io->pt();
     }
 
     if ($this->cli->args['database']) {
       $this->io->timing = true;
       $this->io->pt(1);
-      print $this->database() . "\n";
+      print "\n" . $this->database() . "\n";
       $this->io->pt();
     }
 
     if ($this->cli->args['varnish']) {
       $this->io->timing = true;
       $this->io->pt(1);
-      print $this->varnish() . "\n";
+      print "\n" . $this->varnish() . "\n";
       $this->io->pt();
     }
     if ($this->cli->args['memcache']) {
       $this->io->timing = true;
       $this->io->pt(1);
-      print $this->memcache() . "\n";
+      print "\n" . $this->memcache() . "\n";
       $this->io->pt();
     }
     if ($this->cli->args['drush']) {
       $this->io->timing = true;
       $this->io->pt(1);
-      print $this->drush() . "\n";
+      print "\n" . $this->drush() . "\n";
       $this->io->pt();
     }
   }
@@ -416,10 +347,17 @@ class deploy{
       print 'Error determining ssh_host of ' . $this->cli->args['dest'] . '\n';
       exit();
     }
+    /*
     $this->io->run('drush ' . $this->cli->args['dest'] . ' ac-domain-list ' );
     $res = preg_match('/name(?:\s)+:(?:\s)+(\S+)/', $this->io->stdout, $domain);
+     */
+    // Drush 5
+    //$this->io->run('drush site-alias ' . $this->cli->args['dest'] . ' --component=uri' );
+    // Drush 6
+    $this->io->run('drush site-alias ' . $this->cli->args['dest'] . ' --fields=uri --format=list' );
+    $res = $this->io->stdout;
     if ($res) {
-      $this->cli->args['dest_domain'] = $domain[1];
+      $this->cli->args['dest_domain'] = trim($res);
     } else {
       print 'Error determining domain of ' . $this->cli->args['dest'] . '\n';
       exit();
@@ -435,6 +373,8 @@ class deploy{
   }
   public function get_ac_task() {
     $output = $this->io->stdout . $this->io->stderr;
+    print "--debug--";
+    print $output;
     $res = preg_match('/Task (\d+)/', $output, $task);
     if ($res) {
       $this->task_id = $task[1];
@@ -456,7 +396,7 @@ class deploy{
         if (count($state) > 1) {
           if ($state[1] != 'done') {
             print implode(' ', array('Task', $task_id , 'is', $state[1] ,"...\n"));
-            sleep(5);
+            sleep(10);
           } else {
             print "\nFinished\n";
             return $state[1];
@@ -466,7 +406,7 @@ class deploy{
           print_r($state);
           print "\n";
           $state = array(0 => 'transition', 1 => 'running');
-          sleep(5);
+          sleep(10);
         }
       } else {
         // Didn't find state in the output for some reason, should still wait.
@@ -475,7 +415,7 @@ class deploy{
         print_r($this->io->stdout);
         print "\n";
         $state = array(0 => 'transition', 1 => 'running');
-        sleep(5);
+        sleep(10);
       }
     }
 }
@@ -528,7 +468,9 @@ class deploy{
  * MAIN
  */
 
-$main = new deploy();
+date_default_timezone_set("America/Los_Angeles");
+
+$main = new deploy($help);
 
 $main->processargs($argv);
 
